@@ -27,17 +27,17 @@ layer = "kernel"
 # The guest's root filesystem: the Alpine image, whose one layer is the Alpine
 # minirootfs.
 [rootfs.any]
-image = "docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a"
+image = "docker.io/library/alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf"
 
 # The gvisor-tap-vsock gateway the `--net-gateway` tests run on the host.
 [gvproxy.linux-x86_64]
-url = "https://github.com/containers/gvisor-tap-vsock/releases/download/v0.9.0/gvproxy-linux-amd64"
-sha256 = "95c0ee5b5e5d401094ed58ac2f984ba5e935c2cb416c8752329fcfacb721aa9a"
+url = "https://github.com/containers/gvisor-tap-vsock/releases/download/v0.9.1/gvproxy-linux-amd64"
+sha256 = "57130c0ca7f7d26e6980a8065afb097b7081bda81f866c87357b3eb614b8b4e3"
 
 [gvproxy.linux-aarch64]
-url = "https://github.com/containers/gvisor-tap-vsock/releases/download/v0.9.0/gvproxy-linux-arm64"
-sha256 = "c1ea864636182a774235c8866c70f2a0223dfcd4f08d24e37a7e82d9882beb9c"
+url = "https://github.com/containers/gvisor-tap-vsock/releases/download/v0.9.1/gvproxy-linux-arm64"
+sha256 = "f5aa87a85f24d644b9533db705d874409d4ac4729e3d28e9f3c17928ab816300"
 
 [gvproxy.macos-aarch64]
-url = "https://github.com/containers/gvisor-tap-vsock/releases/download/v0.9.0/gvproxy-darwin"
-sha256 = "e2a6825ba789fe588828b418c09aaf16525dec6d8cb2d16c94e72535dd4606be"
+url = "https://github.com/containers/gvisor-tap-vsock/releases/download/v0.9.1/gvproxy-darwin"
+sha256 = "25d14c07b1aa04a99ceca014be7fb723be045a8884320b59e5b14dbe58e1eff3"
