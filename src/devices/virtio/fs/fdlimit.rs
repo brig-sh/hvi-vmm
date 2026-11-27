@@ -40,86 +40,83 @@
 
 use std::sync::OnceLock;
 
-/// Descriptors held back for the parts of the VMM whose count is fixed when
-/// it starts.
+/// The descriptors held back for the parts of the VMM that hold a fixed number
+/// whatever devices the VM has: the kernel and the initramfs while they load,
+/// the event ledger, the control socket, the network connection and stdio. A
+/// virtio-fs request also holds a few while it is served.
 ///
-/// The descriptor table belongs to the process, not to one device: the block
-/// device, the event ledger, the control socket, the network connection,
-/// stdio and the devices' notification descriptors all draw on it, and so
-/// does a virtio-fs request while it is served. A guest that spends the last
-/// descriptor therefore breaks parts of the VMM it never talks to, and only
-/// virtio-fs translates the failure into an errno the guest can understand
-/// -- everything else fails with no clear cause.
-///
-/// So the guest never gets the last of them. This is the fixed part of the
-/// reserve; see [`vmm_reserve`] for the rest.
+/// A guest that took the process's last descriptor would break parts of the VMM
+/// it never talks to. Only virtio-fs turns that failure into an errno the guest
+/// understands, and every other part fails with no clear cause. [`vmm_reserve`]
+/// adds what the VM's devices hold.
 const BASE_RESERVE: u64 = 128;
 
-/// The descriptors a VM with `exports` exports, and an agent bridge if
-/// `agent`, holds beside its exports' budget.
+/// The descriptors a disk holds while the VM runs: its image, and the two ends
+/// of the pipe that wakes its worker.
+const DISK_DESCRIPTORS: usize = 3;
+
+/// Returns how many descriptors the VMM holds outside its exports' budget, for
+/// a VM with `disks` disks and `exports` exports, and with an agent bridge if
+/// `agent`.
 ///
-/// Beside a fixed part, `BASE_RESERVE`, two parts grow while the VM
-/// runs, and each is bounded where it is made: an export's readahead workers
-/// hold up to `server::READAHEAD_DESCRIPTORS`, and the agent bridge relays
-/// up to `vsock::MAX_HOST_CONNECTIONS` connections of
-/// `vsock::DESCRIPTORS_PER_CONNECTION` each. With every part reserved, the
-/// host refuses a descriptor below the budget only when the system-wide
-/// table is full or a program that embeds hvi holds the room.
+/// The sum is [`BASE_RESERVE`], [`DISK_DESCRIPTORS`] for each disk,
+/// `server::UNBUDGETED_DESCRIPTORS` for each export and, for an agent bridge,
+/// `vsock::DESCRIPTORS_PER_CONNECTION` for each of the
+/// `vsock::MAX_HOST_CONNECTIONS` connections it relays at most. Each part that
+/// grows while the VM runs is bounded where it is made. With every part
+/// reserved, the host refuses a descriptor below the budget only when the
+/// system-wide table is full or a program that embeds hvi holds the room.
 #[must_use]
-pub fn vmm_reserve(exports: usize, agent: bool) -> u64 {
-    let readahead = exports.saturating_mul(super::server::READAHEAD_DESCRIPTORS);
+pub(crate) fn vmm_reserve(disks: usize, exports: usize, agent: bool) -> u64 {
+    use crate::devices::virtio::vsock::{DESCRIPTORS_PER_CONNECTION, MAX_HOST_CONNECTIONS};
+
     let bridge = if agent {
-        crate::devices::virtio::vsock::MAX_HOST_CONNECTIONS
-            * crate::devices::virtio::vsock::DESCRIPTORS_PER_CONNECTION
+        MAX_HOST_CONNECTIONS * DESCRIPTORS_PER_CONNECTION
     } else {
         0
     };
-    BASE_RESERVE.saturating_add(u64::try_from(readahead.saturating_add(bridge)).unwrap_or(u64::MAX))
+    let devices = disks
+        .saturating_mul(DISK_DESCRIPTORS)
+        .saturating_add(exports.saturating_mul(super::server::UNBUDGETED_DESCRIPTORS))
+        .saturating_add(bridge);
+    BASE_RESERVE.saturating_add(u64::try_from(devices).unwrap_or(u64::MAX))
 }
 
-/// The fewest descriptors a guest is given, whatever the reserve: fewer
-/// cannot run a shell.
-pub const MIN_BUDGET: usize = 64;
+/// The fewest descriptors a VM's exports are given, whatever the reserve: a
+/// guest cannot run a shell on fewer.
+pub(crate) const MIN_BUDGET: usize = 64;
 
 /// The most this module asks the kernel for.
 const CEILING: u64 = 65_536;
 
-/// How many host descriptors a VM's exports may pin between them, when the
-/// rest of the VM holds `reserve`.
+/// Returns how many host descriptors a VM's exports may hold between them, when
+/// the process can hold `usable` and the rest of the VMM holds `reserve`.
 ///
-/// Derived from the limit actually in force rather than written down, which
-/// is the point: a fixed number is either so low that it breaks a real build
-/// or so high that it is not a limit. This one is what the process can
-/// really open, less the reserve, so raising `RLIMIT_NOFILE` raises it too.
-/// See `clamp_soft_limit` for what the process can really open.
-///
-/// The guest sees ENFILE on the request that would have crossed it, which is
-/// the errno for "the host is out", and the VMM keeps working.
-///
-/// The budget is the VM's, shared by all its exports, because the table is
-/// the process's: see `server::DescriptorBudget`.
+/// It is the difference, and never less than [`MIN_BUDGET`]. The number is
+/// derived from the limit in force and not written down: a fixed number is
+/// either so low that it breaks a real build or so high that it is not a limit.
+/// `server::DescriptorBudget` says why the VM's exports share it.
 #[must_use]
-pub fn guest_handle_budget(reserve: u64) -> usize {
-    process_budget(usable_limit(), reserve)
-}
-
-/// How many descriptors the process can hold right now: the soft limit or
-/// the kernel's per-process cap, whichever is lower.
-#[must_use]
-pub fn usable_limit() -> u64 {
-    let soft = current_open_file_limit().unwrap_or(256);
-    clamp_soft_limit(soft, per_process_cap())
-}
-
-/// What a process that can hold `usable` descriptors gives the guest when the
-/// rest of the VM holds `reserve`: the difference, but never less than
-/// [`MIN_BUDGET`]. When the floor applies, the guest's handles eat into the
-/// reserve, and the caller says so.
-#[must_use]
-pub fn process_budget(usable: u64, reserve: u64) -> usize {
+pub(crate) fn process_budget(usable: u64, reserve: u64) -> usize {
     usize::try_from(usable.saturating_sub(reserve))
         .unwrap_or(usize::MAX)
         .max(MIN_BUDGET)
+}
+
+/// Returns whether [`process_budget`] is the floor, [`MIN_BUDGET`], because a
+/// process that can hold `usable` has no room for `reserve` and the floor
+/// beside it. The exports' descriptors then come out of the reserve.
+#[must_use]
+pub(crate) fn is_floored(usable: u64, reserve: u64) -> bool {
+    usable < reserve.saturating_add(MIN_BUDGET as u64)
+}
+
+/// Returns how many descriptors the process can hold now; see
+/// `clamp_soft_limit`.
+#[must_use]
+pub(crate) fn usable_limit() -> u64 {
+    let soft = current_open_file_limit().unwrap_or(256);
+    clamp_soft_limit(soft, per_process_cap())
 }
 
 /// Returns how many descriptors a process with the soft limit `soft` can hold
@@ -356,7 +353,7 @@ mod tests {
         let above = set && current_open_file_limit().is_some_and(|soft| soft > cap);
 
         let reported = raise_open_file_limit();
-        let budget = u64::try_from(guest_handle_budget(BASE_RESERVE)).unwrap();
+        let budget = u64::try_from(process_budget(usable_limit(), BASE_RESERVE)).unwrap();
         assert!(
             budget + BASE_RESERVE <= cap,
             "budget {budget} plus the reserve exceeds kern.maxfilesperproc {cap}"
@@ -405,28 +402,36 @@ mod tests {
         }
     }
 
-    // The reserve grows with what the VM can hold beside its budget, so a
-    // second export or an agent bridge takes its descriptors from the guest's
-    // budget rather than from the room the rest of the VMM needs.
+    // The reserve grows with what the VM holds beside its exports' budget, so
+    // another disk, another export or an agent bridge takes its descriptors
+    // from that budget and not from the room the rest of the VMM needs.
     #[test]
-    fn the_reserve_counts_each_export_and_the_agent_bridge() {
-        let readahead = u64::try_from(super::super::server::READAHEAD_DESCRIPTORS).unwrap();
-        let bridge = u64::try_from(
-            crate::devices::virtio::vsock::MAX_HOST_CONNECTIONS
-                * crate::devices::virtio::vsock::DESCRIPTORS_PER_CONNECTION,
-        )
-        .unwrap();
-        assert_eq!(vmm_reserve(0, false), BASE_RESERVE);
-        assert_eq!(vmm_reserve(2, false), BASE_RESERVE + 2 * readahead);
-        assert_eq!(vmm_reserve(1, true), BASE_RESERVE + readahead + bridge);
+    fn reserve_counts_each_disk_each_export_and_the_agent_bridge() {
+        use crate::devices::virtio::vsock::{DESCRIPTORS_PER_CONNECTION, MAX_HOST_CONNECTIONS};
+
+        let disk = u64::try_from(DISK_DESCRIPTORS).unwrap();
+        let export = u64::try_from(super::super::server::UNBUDGETED_DESCRIPTORS).unwrap();
+        let bridge = u64::try_from(MAX_HOST_CONNECTIONS * DESCRIPTORS_PER_CONNECTION).unwrap();
+        assert_eq!(vmm_reserve(0, 0, false), BASE_RESERVE);
+        assert_eq!(vmm_reserve(2, 0, false), BASE_RESERVE + 2 * disk);
+        assert_eq!(vmm_reserve(0, 2, false), BASE_RESERVE + 2 * export);
+        assert_eq!(
+            vmm_reserve(1, 1, true),
+            BASE_RESERVE + disk + export + bridge
+        );
     }
 
     // The budget is what the process can hold less the reserve. A limit too
     // small to leave a guest a shell after the reserve still gives it one.
     #[test]
-    fn the_budget_is_the_usable_limit_less_the_reserve() {
+    fn budget_is_the_usable_limit_less_the_reserve() {
+        let floor = MIN_BUDGET as u64;
         assert_eq!(process_budget(16_384, 456), 16_384 - 456);
+        assert!(!is_floored(16_384, 456));
         assert_eq!(process_budget(256, 456), MIN_BUDGET);
-        assert_eq!(process_budget(456 + MIN_BUDGET as u64, 456), MIN_BUDGET);
+        assert!(is_floored(256, 456));
+        assert_eq!(process_budget(456 + floor, 456), MIN_BUDGET);
+        assert!(!is_floored(456 + floor, 456));
+        assert!(is_floored(456 + floor - 1, 456));
     }
 }

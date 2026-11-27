@@ -265,7 +265,7 @@ impl<C: irq::Chip> DeviceManager<C> {
         #[cfg(target_os = "linux")]
         self.attach_exports(&cfg.fs, ram_fd)?;
         #[cfg(target_os = "macos")]
-        self.attach_exports(&cfg.fs_shares, cfg.agent_sock.is_some())?;
+        self.attach_exports(&cfg.fs_shares, cfg.disks.len(), cfg.agent_sock.is_some())?;
         Ok(())
     }
 
@@ -369,16 +369,21 @@ impl<C: irq::Chip> DeviceManager<C> {
     }
 
     /// Attaches an export for each of `shares`, served in this process, for a
-    /// VM that has an agent bridge if `agent`.
+    /// VM that has `disks` disks, and an agent bridge if `agent`.
     ///
     /// # Errors
     ///
     /// Errors when no slot is left for an export, `worker::attach` fails, or a
     /// range overlaps one already on the bus.
     #[cfg(target_os = "macos")]
-    fn attach_exports(&mut self, shares: &[FsShare], agent: bool) -> Result<(), Error> {
+    fn attach_exports(
+        &mut self,
+        shares: &[FsShare],
+        disks: usize,
+        agent: bool,
+    ) -> Result<(), Error> {
         let slots = self.export_slots(shares.len())?;
-        for (export, slot) in worker::attach(shares, agent)?.into_iter().zip(slots) {
+        for (export, slot) in worker::attach(shares, disks, agent)?.into_iter().zip(slots) {
             self.attach_virtio(DeviceKind::Fs, slot, &export.dev)?;
             export.queue_threads(&self.ram, &mut self.devices.host);
             self.devices.exports.push(export);

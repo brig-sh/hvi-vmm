@@ -45,8 +45,8 @@ pub(crate) struct Export {
     pub(crate) writable: bool,
 }
 
-/// Builds an export for each of `shares`, in order, for a VM that has an
-/// agent bridge if `agent`.
+/// Builds an export for each of `shares`, in order, for a VM that has `disks`
+/// disks, and an agent bridge if `agent`.
 ///
 /// The open-file limit is raised before the first export, since an export holds
 /// a host descriptor for each handle the guest has open. macOS gives a process
@@ -59,9 +59,8 @@ pub(crate) struct Export {
 /// made.
 // An export's root is resolved once, before any guest request; see clippy.toml.
 #[allow(clippy::disallowed_methods)]
-pub(crate) fn attach(shares: &[FsShare], agent: bool) -> io::Result<Vec<Export>> {
-    // What the rest of the VM may hold beside the exports' budget.
-    let reserve = fdlimit::vmm_reserve(shares.len(), agent);
+pub(crate) fn attach(shares: &[FsShare], disks: usize, agent: bool) -> io::Result<Vec<Export>> {
+    let reserve = fdlimit::vmm_reserve(disks, shares.len(), agent);
     if !shares.is_empty() {
         match fdlimit::raise_open_file_limit() {
             Ok(limit) => eprintln!("{LOG_PREFIX} open-file limit: {limit}"),
@@ -70,21 +69,29 @@ pub(crate) fn attach(shares: &[FsShare], agent: bool) -> io::Result<Vec<Export>>
                  a busy guest may see EMFILE as I/O errors"
             ),
         }
-        // Checked after the raise whether or not it worked: a process that
-        // could not raise its limit is the one most likely to be short.
-        let limit = fdlimit::usable_limit();
-        if limit < reserve.saturating_add(fdlimit::MIN_BUDGET as u64) {
-            eprintln!(
-                "{LOG_PREFIX} open-file limit: {limit} leaves no room for the \
-                 {reserve} the VMM holds beside the shares; the guest gets \
-                 {} anyway, so a busy guest can make the host refuse the VMM",
-                fdlimit::MIN_BUDGET
-            );
-        }
     }
-    // One budget for every export: the descriptor table they draw on is the
-    // process's, and one process is one VM.
-    let budget = server::DescriptorBudget::new(fdlimit::guest_handle_budget(reserve));
+    // Read after the raise whether or not it worked: a process that could not
+    // raise its limit is the one most likely to be short.
+    let usable = fdlimit::usable_limit();
+    if !shares.is_empty() && fdlimit::is_floored(usable, reserve) {
+        eprintln!(
+            "{LOG_PREFIX} open-file limit: {usable} is less than the {reserve} descriptors \
+             hvi reserves for itself and {} for the exports; the exports get {} anyway",
+            fdlimit::MIN_BUDGET,
+            fdlimit::MIN_BUDGET
+        );
+    }
+    // One budget for every export; see `server::DescriptorBudget`.
+    let budget = Arc::new(server::DescriptorBudget::new(fdlimit::process_budget(
+        usable, reserve,
+    )));
+    if !shares.is_empty() {
+        eprintln!(
+            "{LOG_PREFIX} virtio-fs: the exports may hold {} open files together; hvi \
+             reserves {reserve} for itself",
+            budget.limit()
+        );
+    }
     let mut exports = Vec::with_capacity(shares.len());
     for (index, share) in shares.iter().enumerate() {
         let root = std::fs::canonicalize(&share.path)?;
@@ -157,7 +164,8 @@ impl Export {
             }
         };
         stderrln!(
-            "{LOG_PREFIX} virtio-fs[{index}]: peak {} of the VM's {} guest handles",
+            "{LOG_PREFIX} virtio-fs[{index}]: peak {} guest handles; the VM's exports may hold \
+             {} open files together",
             dev.peak_handles(),
             dev.descriptor_budget()
         );
