@@ -13251,51 +13251,13 @@ mod tests {
     //
     // Run in a process of its own, because it lowers the open-file limit.
     #[test]
-    fn a_host_refusal_gives_back_parked_descriptors() {
-        use std::io::Read as _;
-        use std::process::{Command, Stdio};
-        use std::time::{Duration, Instant};
-
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "devices::virtio::fs::server::tests::host_refusal_child",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(HOST_REFUSAL_CHILD, "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        // A child that hangs fails the test rather than holding it up.
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let status = loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                break status;
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("the child did not end");
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        let mut out = String::new();
-        child
-            .stdout
-            .take()
-            .unwrap()
-            .read_to_string(&mut out)
-            .unwrap();
-        let mut err = String::new();
-        child
-            .stderr
-            .take()
-            .unwrap()
-            .read_to_string(&mut err)
-            .unwrap();
+    fn host_refusal_closes_parked_descriptors() {
+        let (status, out, err) = crate::testing::run_child_test(
+            "devices::virtio::fs::server::tests::host_refusal_child",
+            HOST_REFUSAL_CHILD,
+            "1",
+            std::time::Duration::from_secs(60),
+        );
         assert!(status.success(), "the child failed:\n{out}\n{err}");
         assert!(
             out.contains("host-refusal-child: ok"),
