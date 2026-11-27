@@ -54,7 +54,7 @@ use std::net::Shutdown;
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Once};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -72,16 +72,23 @@ pub const AGENT_PORT: u32 = 1024;
 
 /// The most host connections the agent bridge relays at once.
 ///
-/// Each one holds three descriptors until it ends: the host stream, and the
-/// two clones its reader and writer threads use. The descriptor table is the
-/// process's, so with no bound a host that opens connections faster than
-/// they end spends descriptors the rest of the VMM needs, virtio-fs among
-/// them. Past the bound the bridge accepts a connection and closes it at
-/// once, as Firecracker does.
+/// With no bound, a host that opens connections faster than they end takes
+/// descriptors and threads that the rest of the VMM needs. Past the bound the
+/// bridge accepts a connection and closes it at once. Firecracker and Cloud
+/// Hypervisor bound their vsock connections at the same number and close a
+/// connection past it the same way.
 ///
-/// An exec is one connection for as long as it runs, and a sandbox runs a
-/// few at once, so this leaves room for many more than it needs.
-pub(crate) const MAX_HOST_CONNECTIONS: usize = 64;
+/// An exec is one connection for as long as it runs, so a burst of execs stays
+/// far below the bound.
+pub(crate) const MAX_HOST_CONNECTIONS: usize = 1023;
+
+/// The descriptors one relayed connection holds until it ends: the host stream
+/// the device writes, and a clone for each of its two relay threads.
+pub(crate) const DESCRIPTORS_PER_CONNECTION: usize = 3;
+
+/// How long the bridge waits before it accepts again after the host refused it
+/// a descriptor or a thread.
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 
 const RX_QUEUE: u16 = 0; // device -> guest
 const TX_QUEUE: u16 = 1; // guest -> device
@@ -1311,6 +1318,9 @@ pub(crate) struct VsockBridge {
     dev: Arc<Mutex<VirtioVsock>>,
     /// Guest RAM, which the device's queues are in.
     mem: Arc<GuestRam>,
+    /// The most connections relayed at once: [`MAX_HOST_CONNECTIONS`], or fewer
+    /// in a test.
+    bound: usize,
 }
 
 /// The guest's agent device and the bridge that serves its host socket.
@@ -1333,34 +1343,86 @@ pub(crate) fn open(path: Option<&str>, ram: &Arc<GuestRam>) -> std::io::Result<O
     };
     let device = Arc::new(Mutex::new(VirtioVsock::new()));
     let bridge = VsockBridge::bind(path, Arc::clone(&device), Arc::clone(ram))?;
+    static RAISED: Once = Once::new();
+    RAISED.call_once(|| {
+        let needed = MAX_HOST_CONNECTIONS * DESCRIPTORS_PER_CONNECTION;
+        if let Err(e) = raise_open_file_limit_by(needed) {
+            eprintln!(
+                "{LOG_PREFIX} virtio-vsock: could not raise the open-file limit by {needed} \
+                 ({e}); the host may refuse a connection before the agent bridge reaches \
+                 {MAX_HOST_CONNECTIONS}"
+            );
+        }
+    });
     eprintln!(
         "{LOG_PREFIX} virtio-vsock: agent bridge on {path} (guest cid {GUEST_CID}, port {AGENT_PORT})"
     );
     Ok(Some(Agent { device, bridge }))
 }
 
+/// The descriptors the rest of the process has run on at the least: the soft
+/// limit macOS gives a process started outside a terminal.
+const DESCRIPTORS_BESIDE_BRIDGE: libc::rlim_t = 256;
+
+/// Raises the soft open-file limit by `needed`, or as far as the hard limit
+/// allows.
+///
+/// A shell on Linux starts a process with a soft limit of 1024, and macOS
+/// starts one outside a terminal with 256. Each is fewer descriptors than the
+/// bridge holds at its bound, so the host would refuse the bridge a descriptor
+/// before it reached the bound, and refuse the rest of the VMM with it. The
+/// bridge's descriptors are added to the limit in force, so the bridge takes
+/// none of the room the process had.
+///
+/// # Errors
+///
+/// Errors if the limit that results is less than `needed` and
+/// [`DESCRIPTORS_BESIDE_BRIDGE`] together. A limit that could not rise, or not
+/// all the way, is enough while it holds both.
+fn raise_open_file_limit_by(needed: usize) -> std::io::Result<()> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes into a struct we own and fully initialized.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let needed = libc::rlim_t::try_from(needed).unwrap_or(libc::rlim_t::MAX);
+    let soft = limit.rlim_cur;
+    limit.rlim_cur = soft.saturating_add(needed).min(limit.rlim_max);
+    let mut cause = std::io::Error::other(format!("the hard limit is {}", limit.rlim_max));
+    // SAFETY: setrlimit reads a struct we own and fully initialized.
+    if limit.rlim_cur > soft && unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+        cause = std::io::Error::last_os_error();
+        limit.rlim_cur = soft;
+    }
+    if limit.rlim_cur < needed.saturating_add(DESCRIPTORS_BESIDE_BRIDGE) {
+        return Err(cause);
+    }
+    Ok(())
+}
+
 /// One connection the bridge relays, and the threads that relay it.
 struct Relay {
     /// The connection's host port in the device.
     port: u32,
-    /// The thread that sends the host the guest's bytes, which holds one
-    /// clone of the host stream.
-    writer: JoinHandle<()>,
-    /// The thread that hands the device the host's bytes, which holds the
-    /// other clone.
-    reader: JoinHandle<()>,
+    /// The connection's relay threads. The writer sends the host the guest's
+    /// bytes and the reader hands the device the host's bytes. Each holds a
+    /// clone of the host stream, and drops it before it is finished.
+    threads: Vec<JoinHandle<()>>,
 }
 
 impl Relay {
-    /// Returns whether any of the connection's descriptors is still open: the
-    /// device's stream while `dev` has the connection, and a clone while its
-    /// thread runs. A thread drops its clone before it is finished.
+    /// Returns whether any of the connection's descriptors is still open.
     ///
-    /// The device can drop a connection while its threads still run, and the
-    /// threads can end while the device still has it, so the bridge counts a
-    /// connection against [`MAX_HOST_CONNECTIONS`] until all three are gone.
-    fn holds_descriptors(&self, dev: &VirtioVsock) -> bool {
-        !self.writer.is_finished() || !self.reader.is_finished() || dev.has_conn(self.port)
+    /// `device` holds the host stream while it has the connection, and each
+    /// relay thread holds a clone while it runs. The device can drop a
+    /// connection while its threads still run, and the threads can end while
+    /// the device still has it, so the bridge counts a connection against its
+    /// bound until every one of them is closed.
+    fn is_live(&self, device: &VirtioVsock) -> bool {
+        self.threads.iter().any(|thread| !thread.is_finished()) || device.has_conn(self.port)
     }
 }
 
@@ -1395,7 +1457,12 @@ impl VsockBridge {
             std::io::Error::new(e.kind(), format!("cannot bind Unix socket {path}: {e}"))
         })?;
         listener.set_nonblocking(true)?;
-        Ok(Self { listener, dev, mem })
+        Ok(Self {
+            listener,
+            dev,
+            mem,
+            bound: MAX_HOST_CONNECTIONS,
+        })
     }
 
     /// Accepts and relays agent connections until `stop` is requested.
@@ -1404,10 +1471,17 @@ impl VsockBridge {
     /// the ones still running before it returns. On Linux they inherit the
     /// seccomp filter of the thread that runs this.
     pub(crate) fn run(self, stop: &StopToken) {
-        let Self { listener, dev, mem } = self;
+        let Self {
+            listener,
+            dev,
+            mem,
+            bound,
+        } = self;
         let mut relays: Vec<Relay> = Vec::new();
         let mut gates = WriterGates(Vec::new());
+        // Each is logged when it starts, not for every connection it costs.
         let mut refusing = false;
+        let mut short = false;
         loop {
             match stop.wait(listener.as_fd()) {
                 Ok(true) => {}
@@ -1417,19 +1491,34 @@ impl VsockBridge {
                     break;
                 }
             }
-            let Ok((stream, _)) = listener.accept() else {
-                continue;
+            let stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                // Nothing is queued, or the client has gone already.
+                Err(e) if no_connection(&e) => continue,
+                Err(e) => {
+                    // The host is out of descriptors, most likely. The client
+                    // stays queued, so the wait above returns at once, and
+                    // without a pause this thread would spin until the host has
+                    // a descriptor to give.
+                    if !short {
+                        stderrln!(
+                            "{LOG_PREFIX} vsock bridge: cannot accept a connection ({e}); \
+                             trying again until the host allows it"
+                        );
+                        short = true;
+                    }
+                    std::thread::sleep(ACCEPT_RETRY);
+                    continue;
+                }
             };
             {
-                let d = dev.lock().unwrap();
-                relays.retain(|relay| relay.holds_descriptors(&d));
+                let device = dev.lock().unwrap();
+                relays.retain(|relay| relay.is_live(&device));
             }
-            if relays.len() >= MAX_HOST_CONNECTIONS {
-                // Logged once each time the bridge reaches the bound, rather
-                // than for every connection a busy client opens past it.
+            if relays.len() >= bound {
                 if !refusing {
                     stderrln!(
-                        "{LOG_PREFIX} vsock bridge: {MAX_HOST_CONNECTIONS} connections are open; closing new ones until one ends"
+                        "{LOG_PREFIX} vsock bridge: {bound} connections are open; closing new ones until one ends"
                     );
                     refusing = true;
                 }
@@ -1437,20 +1526,29 @@ impl VsockBridge {
                 continue;
             }
             refusing = false;
-            let Ok(reader) = stream.try_clone() else {
-                continue;
-            };
-            let Ok(writer) = stream.try_clone() else {
-                continue;
+            let clones = stream
+                .try_clone()
+                .and_then(|reader| Ok((reader, stream.try_clone()?)));
+            let (reader, writer) = match clones {
+                Ok(clones) => clones,
+                Err(e) => {
+                    if !short {
+                        stderrln!(
+                            "{LOG_PREFIX} vsock bridge: closing a connection that cannot be relayed ({e})"
+                        );
+                        short = true;
+                    }
+                    continue;
+                }
             };
             // Register the connection and send the guest agent a REQUEST.
             let (port, writer_gate) = {
-                let mut d = dev.lock().unwrap();
-                let Ok(port) = d.add_conn(stream) else {
+                let mut device = dev.lock().unwrap();
+                let Ok(port) = device.add_conn(stream) else {
                     continue;
                 };
-                d.connect(&mem, port);
-                (port, d.writer_gate(port))
+                device.connect(&mem, port);
+                (port, device.writer_gate(port))
             };
             let Some(writer_gate) = writer_gate else {
                 continue;
@@ -1458,25 +1556,53 @@ impl VsockBridge {
             // A gate only this list holds belongs to a connection that is gone.
             gates.0.retain(|gate| Arc::strong_count(gate) > 1);
             gates.0.push(Arc::clone(&writer_gate));
-            relays.push(Relay {
+            let mut relay = Relay {
                 port,
-                writer: Self::spawn_writer(&dev, &mem, stop, port, writer, writer_gate),
-                reader: Self::spawn_reader(&dev, &mem, stop, port, reader),
-            });
+                threads: Vec::with_capacity(2),
+            };
+            let spawned = Self::spawn_writer(&dev, &mem, stop, port, writer, writer_gate)
+                .and_then(|writer| {
+                    relay.threads.push(writer);
+                    Self::spawn_reader(&dev, &mem, stop, port, reader)
+                })
+                .map(|reader| relay.threads.push(reader));
+            match spawned {
+                Ok(()) => short = false,
+                Err(e) => {
+                    if !short {
+                        stderrln!(
+                            "{LOG_PREFIX} vsock bridge: closing a connection that cannot be relayed ({e})"
+                        );
+                        short = true;
+                    }
+                    // The host end is gone as far as the guest can tell: it
+                    // gets a reset, and the device drops the connection, which
+                    // ends a relay thread that did start.
+                    let mut device = dev.lock().unwrap();
+                    device.host_eof(&mem, port);
+                    device.host_gone(&mem, port);
+                }
+            }
+            // Counted even when a thread is missing, until what it does hold is
+            // closed.
+            relays.push(relay);
         }
         // Dropping the connections shuts their sockets down and opens their
         // gates, so every reader and writer ends.
         drop(gates);
         dev.lock().unwrap().drop_conns();
-        for relay in relays {
-            let _ = relay.writer.join();
-            let _ = relay.reader.join();
+        for thread in relays.into_iter().flat_map(|relay| relay.threads) {
+            let _ = thread.join();
         }
     }
 
     /// Spawns the thread that sends connection `port` the guest's bytes the
     /// vCPU could not. It waits for the socket to take them, without the device
     /// lock.
+    ///
+    /// # Errors
+    ///
+    /// Errors if the host does not start the thread.
     fn spawn_writer(
         dev: &Arc<Mutex<VirtioVsock>>,
         mem: &Arc<GuestRam>,
@@ -1484,9 +1610,9 @@ impl VsockBridge {
         port: u32,
         writer: UnixStream,
         gate: Arc<HostGate>,
-    ) -> JoinHandle<()> {
+    ) -> std::io::Result<JoinHandle<()>> {
         let (dev, mem, stop) = (Arc::clone(dev), Arc::clone(mem), stop.clone());
-        std::thread::spawn(move || loop {
+        std::thread::Builder::new().spawn(move || loop {
             gate.wait_open();
             match stop.wait_writable(writer.as_fd()) {
                 Ok(true) => {}
@@ -1505,15 +1631,19 @@ impl VsockBridge {
 
     /// Spawns the thread that hands connection `port`'s bytes from the host to
     /// the device.
+    ///
+    /// # Errors
+    ///
+    /// Errors if the host does not start the thread.
     fn spawn_reader(
         dev: &Arc<Mutex<VirtioVsock>>,
         mem: &Arc<GuestRam>,
         stop: &StopToken,
         port: u32,
         mut reader: UnixStream,
-    ) -> JoinHandle<()> {
+    ) -> std::io::Result<JoinHandle<()>> {
         let (dev, mem, stop) = (Arc::clone(dev), Arc::clone(mem), stop.clone());
-        std::thread::spawn(move || {
+        std::thread::Builder::new().spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
                 match stop.wait(reader.as_fd()) {
@@ -1548,6 +1678,17 @@ impl VsockBridge {
             }
         })
     }
+}
+
+/// Returns whether an accept that failed with `e` left no connection queued:
+/// none was waiting, or the client closed before it was accepted.
+fn no_connection(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::ConnectionAborted
+    )
 }
 
 /// Returns whether a bridge read that failed with `e` should poll again.
@@ -1683,68 +1824,45 @@ mod tests {
         bound.expect("the stale socket replaced");
     }
 
-    /// Returns whether the bridge closed `conn`. A connection it relays to a
-    /// guest that has not answered carries nothing, so it stays unreadable.
+    /// Returns whether the bridge closed `conn` before `deadline`.
     ///
-    /// Polled rather than read with a timeout: macOS refuses to set a timeout
-    /// on a socket whose peer has closed it.
-    fn bridge_closed(conn: &mut UnixStream) -> bool {
+    /// A connection the bridge relays to a guest that has not answered carries
+    /// nothing, so it stays unreadable. The socket is polled, not read with a
+    /// timeout, because macOS refuses to set a timeout on a socket whose peer
+    /// has closed it.
+    fn bridge_closed(conn: &mut UnixStream, deadline: Instant) -> bool {
         let mut fds = [pollfd(conn.as_raw_fd())];
-        poll(&mut fds, Some(Instant::now() + Duration::from_millis(200))).unwrap();
+        poll(&mut fds, Some(deadline)).unwrap();
         fds[0].revents != 0 && matches!(conn.read(&mut [0u8; 1]), Ok(0))
     }
 
-    // Every connection holds descriptors and threads until it ends, out of a
-    // table virtio-fs and the rest of the VMM draw on too. A client that opens
-    // them faster than they end must not spend it.
+    // Every connection holds descriptors and threads until it ends, out of what
+    // the rest of the VMM draws on too. A client that opens connections faster
+    // than they end must not exhaust the descriptor table.
     #[allow(clippy::disallowed_methods)]
     #[test]
-    fn the_bridge_closes_connections_past_its_bound() {
-        // The test holds a descriptor per client and the bridge three per
-        // connection, more than macOS's default soft limit of 256. Raising
-        // it toward the hard limit touches no other test; a host that will
-        // not raise it far enough cannot run this one.
-        let mut lim = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: getrlimit writes into a struct we own and fully initialized.
-        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
-        let needed = 1024;
-        if lim.rlim_cur < needed {
-            let mut raised = lim;
-            raised.rlim_cur = needed.min(lim.rlim_max);
-            // SAFETY: setrlimit reads a struct we own and fully initialized.
-            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } != 0
-                || raised.rlim_cur < needed
-            {
-                use std::io::Write as _;
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "the_bridge_closes_connections_past_its_bound: skipped, \
-                     the open-file limit cannot reach {needed}"
-                );
-                return;
-            }
-        }
+    fn bridge_closes_connections_past_its_bound() {
+        const BOUND: usize = 4;
         let path = std::env::temp_dir().join(format!("hvi-agent-bound-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        let bridge = bind_at(&path).unwrap();
+        let mut bridge = bind_at(&path).unwrap();
+        bridge.bound = BOUND;
         let stop = crate::teardown::StopSource::new().unwrap();
         let token = stop.token();
         let running = std::thread::spawn(move || bridge.run(&token));
         let connect = || UnixStream::connect(&path).unwrap();
 
-        let mut open: Vec<UnixStream> = (0..MAX_HOST_CONNECTIONS).map(|_| connect()).collect();
+        let mut open: Vec<UnixStream> = (0..BOUND).map(|_| connect()).collect();
         let mut past = connect();
         assert!(
-            bridge_closed(&mut past),
+            bridge_closed(&mut past, Instant::now() + Duration::from_secs(10)),
             "a connection past the bound was kept"
         );
-        // The bridge accepts in order, so every earlier one was taken.
-        for (i, conn) in open.iter_mut().enumerate().take(3) {
+        // The bridge accepts in order, so it had taken every earlier one by
+        // then, and a short wait shows that it kept them.
+        for (i, conn) in open.iter_mut().enumerate() {
             assert!(
-                !bridge_closed(conn),
+                !bridge_closed(conn, Instant::now() + Duration::from_millis(50)),
                 "connection {i}, within the bound, was closed"
             );
         }
@@ -1754,7 +1872,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         let kept = loop {
             let mut next = connect();
-            if !bridge_closed(&mut next) {
+            if !bridge_closed(&mut next, Instant::now() + Duration::from_millis(200)) {
                 break next;
             }
             assert!(
@@ -1767,6 +1885,35 @@ mod tests {
         running.join().unwrap();
         let _ = std::fs::remove_file(&path);
         drop(kept);
+    }
+
+    // The bridge's descriptors at its bound are more than the soft limit a
+    // process starts with on Linux or macOS, so the bridge adds them to it.
+    #[test]
+    fn open_file_limit_rises_by_what_the_bridge_holds() {
+        let limit = || {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: getrlimit writes into a struct we own and fully
+            // initialized.
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+                0
+            );
+            limit
+        };
+        let before = limit();
+        let raised = raise_open_file_limit_by(8);
+        let wanted = before.rlim_cur.saturating_add(8);
+        // Another test may have raised the limit in between, so it is at least
+        // what this raise asked for.
+        let after = limit().rlim_cur;
+        assert!(after >= wanted.min(before.rlim_max));
+        // A limit the hard limit cut short is refused only when it cannot hold
+        // the bridge's descriptors beside the rest of the process's.
+        assert_eq!(raised.is_ok(), after >= 8 + DESCRIPTORS_BESIDE_BRIDGE);
     }
 }
 
@@ -3177,6 +3324,27 @@ mod session_tests {
         transmit(&mut dev, &mem, &pkt(OP_RW, port, b"late"));
         assert_eq!(last_delivered(&mem).op, OP_RST);
         assert!(!dev.conns.contains_key(&port));
+        assert_eq!(resets_delivered(&mem), 1);
+    }
+
+    // The bridge gives a connection up with these two calls when the host will
+    // not start its relay threads, which can be before the guest has answered.
+    // The device must drop the connection, or it would keep its descriptor and
+    // its place in the bridge's bound, and the guest must get a reset for the
+    // REQUEST it was sent.
+    #[test]
+    fn connection_given_up_before_the_guest_answers_is_dropped_and_reset() {
+        let mem = mem_of(0x10000);
+        let mut dev = VirtioVsock::new();
+        program_rx_buffers(&mut dev, &mem, RINGS, 8, RXBUF);
+        let (dev_side, _peer) = UnixStream::pair().unwrap();
+        let port = dev.add_conn(dev_side).unwrap();
+        dev.connect(&mem, port);
+
+        dev.host_eof(&mem, port);
+        dev.host_gone(&mem, port);
+        assert!(!dev.has_conn(port), "the device kept the connection");
+        assert_eq!(last_delivered(&mem).op, OP_RST);
         assert_eq!(resets_delivered(&mem), 1);
     }
 
