@@ -128,7 +128,7 @@ pub(crate) fn attach(
             if writable { "read-write" } else { "read-only" }
         );
         let mut dev = VirtioFs::new(root.clone(), &share.tag, writable, share.cache)?;
-        dev.join_budget(&budget);
+        dev.join_budget(&budget, shares.len());
         dev.set_guest_ids(server::GuestIds {
             uid: share.uid,
             gid: share.gid,
