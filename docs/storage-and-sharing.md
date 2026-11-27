@@ -289,9 +289,12 @@ components itself. Treat containment as strong and tested, not as proven.
 - **The descriptor budget is per export, the descriptor table is per process.**
   Each export refuses an `OPEN` or `OPENDIR` past its budget with `ENFILE`.
   The budget is the open-file limit hvi logs at startup, less a reserve of 128;
-  see [Startup output](cli.md#startup-output). `CREATE` and `TMPFILE` are not
-  counted against it, and directory descriptors cached for readdir are not
-  either, so several busy exports can still exhaust the table.
+  see [Startup output](cli.md#startup-output). If the host refuses a descriptor
+  first, the guest gets the refusal, and the export closes half its parked and
+  cached directory descriptors so the requests after it find room. It closes
+  only its own, so it cannot make room that another export holds. `CREATE` and
+  `TMPFILE` are not counted against it, and directory descriptors cached for
+  readdir are not either, so several busy exports can still exhaust the table.
 - **One request queue per share on macOS**, plus a hiprio queue. A Linux
   export takes `num_queues=`. No DAX window. The
   device reports no shared memory region, and a guest built with `FUSE_DAX`
