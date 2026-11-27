@@ -1240,6 +1240,9 @@ struct ParkedCache {
     /// like any other, so they count against the same budget as the guest's own
     /// handles rather than adding to it.
     limit: usize,
+    /// How many descriptors were evicted to make room since the device was
+    /// made, for the stop report.
+    evictions: u64,
 }
 
 impl ParkedCache {
@@ -1249,6 +1252,7 @@ impl ParkedCache {
             order: VecDeque::new(),
             ticks: 0,
             limit,
+            evictions: 0,
         }
     }
 
@@ -1302,6 +1306,7 @@ impl ParkedCache {
             if self.map.get(&node).map(|p| p.tick) != Some(tick) {
                 continue;
             }
+            self.evictions += 1;
             return self.remove(node);
         }
         None
@@ -1339,11 +1344,13 @@ impl ParkedCache {
     }
 }
 
-/// An export's parked cache, locked. It stores the cache's length in the export
-/// when it unlocks, so that length can be read without the lock.
+/// An export's parked cache, locked. It stores the cache's length and its count
+/// of evictions in the export when it unlocks, so both can be read without the
+/// lock.
 struct ParkedGuard<'a> {
     cache: MutexGuard<'a, ParkedCache>,
     len: &'a AtomicUsize,
+    evictions: &'a AtomicU64,
 }
 
 impl std::ops::Deref for ParkedGuard<'_> {
@@ -1363,6 +1370,8 @@ impl std::ops::DerefMut for ParkedGuard<'_> {
 impl Drop for ParkedGuard<'_> {
     fn drop(&mut self) {
         self.len.store(self.cache.len(), Ordering::Relaxed);
+        self.evictions
+            .store(self.cache.evictions, Ordering::Relaxed);
     }
 }
 
@@ -1380,6 +1389,10 @@ struct ExportDescriptors {
     /// released. The budget is summed from it, so an open that the budget gates
     /// takes no export's parked lock to count.
     parked_len: AtomicUsize,
+    /// The number of descriptors `parked` has evicted, stored each time its
+    /// lock is released. The stop report reads it, and must not wait for a lock
+    /// that another export's worker can hold.
+    parked_evictions: AtomicU64,
 }
 
 impl ExportDescriptors {
@@ -1388,6 +1401,7 @@ impl ExportDescriptors {
             exclusive: AtomicUsize::new(0),
             parked: Mutex::new(ParkedCache::new(parked_limit)),
             parked_len: AtomicUsize::new(0),
+            parked_evictions: AtomicU64::new(0),
         }
     }
 
@@ -1399,6 +1413,7 @@ impl ExportDescriptors {
         ParkedGuard {
             cache: self.parked.lock().unwrap_or_else(PoisonError::into_inner),
             len: &self.parked_len,
+            evictions: &self.parked_evictions,
         }
     }
 
@@ -1582,6 +1597,21 @@ impl DescriptorBudget {
         // on the lock meanwhile.
         drop(evicted);
     }
+}
+
+/// What an export's parked cache did since its device was made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParkedStats {
+    /// Opens served from a parked descriptor.
+    pub hits: u64,
+    /// Opens that reached the host: a file's first open, an open that may not
+    /// reuse a descriptor, and an open whose descriptor had been closed.
+    pub misses: u64,
+    /// Parked descriptors closed to make room, for the cache's own bound or for
+    /// the VM's budget, whichever export needed the room.
+    pub evicted: u64,
+    /// Descriptors parked now.
+    pub held: usize,
 }
 
 /// A virtio-fs device exporting exactly one canonical host directory.
@@ -3882,6 +3912,52 @@ impl VirtioFs {
             self.parked_misses,
             self.own.parked_len.load(Ordering::Relaxed),
         )
+    }
+
+    /// Returns what the parked cache did since the device was made, or `None`
+    /// under `cache=none`, where nothing is parked and every open would count
+    /// as a miss.
+    ///
+    /// It takes no lock, so the stop report can call it while another export's
+    /// worker holds this export's parked cache.
+    #[must_use]
+    pub fn parked_stats(&self) -> Option<ParkedStats> {
+        (self.cache_policy != CachePolicy::None).then(|| ParkedStats {
+            hits: self.parked_hits,
+            misses: self.parked_misses,
+            evicted: self.own.parked_evictions.load(Ordering::Relaxed),
+            held: self.own.parked_len.load(Ordering::Relaxed),
+        })
+    }
+
+    /// Opens the file `name` in the export's root and releases it, `times`
+    /// times over, for a test outside this module that needs the parked
+    /// counters to move.
+    #[cfg(test)]
+    pub(crate) fn open_and_release(&mut self, name: &str, times: usize) {
+        let request = |opcode: u32, node: u64, payload: &[u8]| {
+            let mut out = Vec::new();
+            put_u32(&mut out, (IN_HEADER_LEN + payload.len()) as u32);
+            put_u32(&mut out, opcode);
+            put_u64(&mut out, 1);
+            put_u64(&mut out, node);
+            out.resize(IN_HEADER_LEN, 0);
+            out.extend_from_slice(payload);
+            out
+        };
+        let mut lookup = name.as_bytes().to_vec();
+        lookup.push(0);
+        let out = self.handle_fuse(&request(LOOKUP, FUSE_ROOT_ID, &lookup), 4096);
+        assert_eq!(get_u32(&out, 4), Some(0), "LOOKUP of {name} failed");
+        let node = get_u64(&out, OUT_HEADER_LEN).unwrap();
+        for _ in 0..times {
+            let out = self.handle_fuse(&request(OPEN, node, &[0u8; 8]), 4096);
+            assert_eq!(get_u32(&out, 4), Some(0), "OPEN of {name} failed");
+            let mut release = vec![0u8; 24];
+            release[..8].copy_from_slice(&get_u64(&out, OUT_HEADER_LEN).unwrap().to_le_bytes());
+            let out = self.handle_fuse(&request(RELEASE, node, &release), 4096);
+            assert_eq!(get_u32(&out, 4), Some(0), "RELEASE of {name} failed");
+        }
     }
 
     fn insert_handle(
@@ -13970,6 +14046,61 @@ mod tests {
 
         release_handle(&mut exports[0].1, node, fh);
         for (dir, _) in exports {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    // The stop report's eviction count is how a workload shows what the bounds
+    // cost it, so it counts a descriptor closed for the cache's own bound and
+    // one that another export closed for the VM's budget. A descriptor the
+    // guest reopens is not an eviction.
+    #[test]
+    fn parked_stats_count_evictions_for_either_bound() {
+        const LIMIT: usize = 4;
+        let budget = Arc::new(DescriptorBudget::new(LIMIT));
+        let (dir_a, mut a) = fixture_with_access(true);
+        let (dir_b, mut b) = fixture_with_access(true);
+        a.join_budget(&budget, 2);
+        b.join_budget(&budget, 2);
+        a.own.parked().limit = 2;
+        for name in ["f0", "f1", "f2"] {
+            fs::write(dir_a.join(name), b"x").unwrap();
+            fs::write(dir_b.join(name), b"x").unwrap();
+        }
+
+        // A parks three files in a cache of two, then reopens one of them.
+        a.open_and_release("f0", 1);
+        a.open_and_release("f1", 1);
+        a.open_and_release("f2", 2);
+        let stats = a.parked_stats().unwrap();
+        assert_eq!(
+            stats,
+            ParkedStats {
+                hits: 1,
+                misses: 3,
+                evicted: 1,
+                held: 2
+            }
+        );
+
+        // B holds the rest of the budget and one more, which closes one of A's.
+        b.own.parked().limit = 0;
+        let held: Vec<(u64, u64)> = ["f0", "f1", "f2"]
+            .iter()
+            .map(|name| {
+                let node = lookup_node(&mut b, FUSE_ROOT_ID, name.as_bytes());
+                (node, try_open(&mut b, node, 0).unwrap())
+            })
+            .collect();
+        let stats = a.parked_stats().unwrap();
+        assert_eq!((stats.evicted, stats.held), (2, 1));
+
+        for (node, fh) in held {
+            release_handle(&mut b, node, fh);
+        }
+        let (dir_c, c) = fixture_with_cache(true, CachePolicy::None);
+        assert_eq!(c.parked_stats(), None, "cache=none parks nothing");
+        for dir in [dir_a, dir_b, dir_c] {
             let _ = fs::remove_dir_all(dir);
         }
     }
