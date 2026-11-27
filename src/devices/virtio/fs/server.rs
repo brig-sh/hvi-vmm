@@ -2063,8 +2063,8 @@ impl VirtioFs {
             SETUPMAPPING | REMOVEMAPPING => Err(EOPNOTSUPP),
             _ => Err(ENOSYS),
         };
-        if matches!(result, Err(EMFILE | ENFILE)) {
-            self.after_host_refusal(opcode, &result);
+        if self.host_refused(opcode, &result) {
+            self.shrink_caches();
         }
         self.note_op_time(opcode, op_start);
         if self.lock_to_park.is_some() {
@@ -2078,40 +2078,41 @@ impl VirtioFs {
         }
     }
 
-    /// Gives back part of what the device keeps for speed after a request
-    /// failed with `result` for want of a descriptor. The guest gets the
-    /// refusal either way.
+    /// Returns whether `result` is the host refusing request `opcode` a
+    /// descriptor.
     ///
-    /// The host refuses below the budget only when something the budget does
-    /// not count has spent the room: another export, the rest of the VMM,
-    /// another process filling the system-wide table, or the descriptors of a
-    /// program that embeds hvi. The parked descriptors and cached directories
-    /// are kept only for speed, so closing them takes nothing the guest
-    /// holds, and the requests after the refusal find room in what they held.
-    ///
-    /// The readahead queue also holds descriptors the guest has no claim on,
-    /// a parent for each queued directory. They stay: there are at most
-    /// [`READAHEAD_MAX_QUEUED`], few next to what the caches give back, and
-    /// closing them would throw away listings prepared for the guest's walk.
-    fn after_host_refusal(&mut self, opcode: u32, result: &Result<Vec<u8>, i32>) {
-        // The device's own ENFILE: OPEN checks the guest's handle limit before
-        // it asks the host. What is spent then is the guest's handles, not
-        // the caches, so closing those would cost the next opens their hits
-        // and win nothing.
-        if opcode == OPEN && *result == Err(ENFILE) && self.open_handle_count() >= self.handle_limit
-        {
-            return;
-        }
-        self.give_back_descriptors();
+    /// The device's own ENFILE is not: OPEN checks the guest's handle limit
+    /// before it asks the host. What is spent then is the guest's handles, not
+    /// the caches, so closing those would cost the next opens their hits and
+    /// make no room.
+    fn host_refused(&self, opcode: u32, result: &Result<Vec<u8>, i32>) -> bool {
+        let at_handle_limit = opcode == OPEN
+            && *result == Err(ENFILE)
+            && self.open_handle_count() >= self.handle_limit;
+        matches!(result, Err(EMFILE | ENFILE)) && !at_handle_limit
     }
 
     /// Closes half the parked descriptors and half the cached directories,
-    /// oldest first, and at least one of each where there is one.
+    /// oldest first, and at least one of each where there is one. The device
+    /// calls it after the host refused a descriptor, and the guest gets that
+    /// refusal either way.
     ///
-    /// Half rather than all: the refusal says the table is full now, not how
-    /// much room the next requests need, and emptying both caches would make
-    /// every open after it pay the host for a walk it had already made.
-    fn give_back_descriptors(&mut self) {
+    /// The host refuses below the budget only when something the budget does
+    /// not count has taken the room: another export, the rest of the VMM,
+    /// another process filling the system-wide table, or the descriptors of a
+    /// program that embeds hvi. The parked descriptors and cached directories
+    /// are kept only for speed, so closing them takes nothing the guest holds,
+    /// and the requests after the refusal find room.
+    ///
+    /// Only half is closed, because the refusal says the table is full now, not
+    /// how much room the next requests need. Closing all of both caches would
+    /// send every later open back to the host.
+    ///
+    /// The readahead queue also holds descriptors the guest does not hold, a
+    /// parent for each queued directory. They stay open: there are at most
+    /// [`READAHEAD_MAX_QUEUED`], few next to what the caches hold, and closing
+    /// them would discard listings prepared for the guest's walk.
+    fn shrink_caches(&mut self) {
         for _ in 0..self.parked.len().div_ceil(2) {
             self.evict_one_parked();
         }
@@ -13240,14 +13241,15 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// Set in the child [`host_refusal_child`] runs in.
+    /// The environment variable that marks the child process
+    /// [`host_refusal_child`] runs in.
     const HOST_REFUSAL_CHILD: &str = "HVI_VIRTIO_FS_HOST_REFUSAL_CHILD";
 
     // The budget leaves the rest of the process a reserve, but something it
-    // does not count can still spend the room: the rest of the VMM, another
-    // process, or a soft limit the budget got wrong. Then the host refuses
-    // first, and the device gives back what it keeps only for speed, so the
-    // guest's next request is served.
+    // does not count can still take the room: another export, the rest of the
+    // VMM or another process. Then the host refuses first, and the device
+    // closes half of what it keeps only for speed, so the guest's next request
+    // is served.
     //
     // Run in a process of its own, because it lowers the open-file limit.
     #[test]
@@ -13275,8 +13277,8 @@ mod tests {
         for i in 0..FILES {
             fs::write(dir.join(format!("f{i}")), b"x").unwrap();
         }
-        // An estimate far above what the host will give, as a soft limit
-        // above kern.maxfilesperproc produced.
+        // A budget far above what the host will give, so the host refuses
+        // before the budget does.
         dev.handle_limit = 1_000_000;
         dev.parked_limit = 1_000_000;
         let nodes: Vec<u64> = (0..FILES)
@@ -13303,17 +13305,17 @@ mod tests {
             other => other,
         };
 
-        // Open and release every file once. Each release parks a descriptor,
-        // so the host refuses long before the last file. Each refusal closes
-        // half the parked descriptors, so the open after it is served.
+        // Open and release every file once. Each release parks a descriptor, so
+        // the host refuses long before the last file. Each refusal closes half
+        // the parked descriptors, so the open after it is served.
         for (i, node) in nodes.iter().enumerate() {
             let fh = open_again_once(&mut dev, *node)
                 .unwrap_or_else(|e| panic!("open {i} of {FILES} was refused twice, with {e}"));
             release_handle(&mut dev, *node, fh);
         }
 
-        // Now hold every handle. Once nothing is left to give back, the host
-        // refuses for real, and the guest is told so.
+        // Now hold every handle. Once the caches are empty, the host refuses
+        // again on the second try, and the guest is told so.
         let mut held = Vec::new();
         let mut refusal = None;
         for node in &nodes {
