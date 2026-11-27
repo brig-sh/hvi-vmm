@@ -58,7 +58,7 @@ runs:
       shell: bash
       env:
         # renovate: datasource=crate depName=virtiofsd
-        VIRTIOFSD_VERSION: 1.14.0
+        VIRTIOFSD_VERSION: 1.15.0
       run: |
         root="$HOME/.cache/hvi-e2e/virtiofsd/$VIRTIOFSD_VERSION"
         virtiofsd="$root/bin/virtiofsd"
