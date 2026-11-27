@@ -335,9 +335,9 @@ booting Image with 1024 MiB ...
 
 `[hvi] open-file limit:` appears only on macOS, and only when at least one
 share is configured, because the limit is raised while the first share is set
-up. The number is what the process can really hold: the soft `RLIMIT_NOFILE`
-or the kernel's `kern.maxfilesperproc`, whichever is lower. Each share's
-handle budget is that number less 128.
+up. The number is what the process can really hold: the soft `RLIMIT_NOFILE` or
+the kernel's `kern.maxfilesperproc`, whichever is lower. Each share's handle
+budget is that number less 128.
 
 On a clean stop, macOS reports each share's peak handle count:
 
