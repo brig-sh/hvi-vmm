@@ -364,9 +364,9 @@ pub(crate) fn install_kick_handler() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::os::unix::process::ExitStatusExt;
-    use std::process::{Command, ExitStatus, Stdio};
+    use std::process::ExitStatus;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
@@ -399,46 +399,13 @@ mod tests {
     /// Runs [`stop_signal_child`] for `case` in a process of its own, so no
     /// other test has touched the signals' actions, and returns how it ended
     /// and what it wrote to stdout and to stderr.
-    ///
-    /// A child that hangs fails the test rather than holding it up.
     fn run_child(case: &str) -> (ExitStatus, String, String) {
-        // `--nocapture`, since the case can end the process before the test
-        // harness prints what it captured.
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "signal::tests::stop_signal_child", "--nocapture"])
-            .env(CHILD, case)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let status = loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                break status;
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("the child for {case} did not end");
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        let mut out = String::new();
-        child
-            .stdout
-            .take()
-            .unwrap()
-            .read_to_string(&mut out)
-            .unwrap();
-        let mut err = String::new();
-        child
-            .stderr
-            .take()
-            .unwrap()
-            .read_to_string(&mut err)
-            .unwrap();
-        (status, out, err)
+        crate::testing::run_child_test(
+            "signal::tests::stop_signal_child",
+            CHILD,
+            case,
+            Duration::from_secs(20),
+        )
     }
 
     /// Whether the handler a test installs before [`stop_on_signals`] ran.

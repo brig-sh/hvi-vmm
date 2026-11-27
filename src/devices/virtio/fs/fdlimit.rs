@@ -220,9 +220,7 @@ fn desired_limit(hard: u64) -> u64 {
 mod tests {
     use super::*;
 
-    use std::io::Read as _;
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     #[test]
     fn an_unlimited_hard_limit_is_clamped_to_something_real() {
@@ -274,55 +272,22 @@ mod tests {
     // Run in a process of its own: the open-file limit is the process's, and
     // the tests running alongside this one read it.
     #[test]
-    fn the_budget_fits_under_what_the_kernel_gives_one_process() {
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "devices::virtio::fs::fdlimit::tests::budget_above_cap_child",
-                "--nocapture",
-            ])
-            .env(ABOVE_CAP_CHILD, "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        // A child that hangs fails the test rather than holding it up.
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let status = loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                break status;
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("the child did not end");
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        let mut out = String::new();
-        child
-            .stdout
-            .take()
-            .unwrap()
-            .read_to_string(&mut out)
-            .unwrap();
-        let mut err = String::new();
-        child
-            .stderr
-            .take()
-            .unwrap()
-            .read_to_string(&mut err)
-            .unwrap();
+    fn budget_fits_under_what_the_kernel_gives_one_process() {
+        let (status, out, err) = crate::testing::run_child_test(
+            "devices::virtio::fs::fdlimit::tests::budget_above_cap_child",
+            ABOVE_CAP_CHILD,
+            "1",
+            Duration::from_secs(20),
+        );
         assert!(status.success(), "the child failed:\n{out}\n{err}");
         if out.contains("above-cap-child: skipped") {
-            // Passing, but without having checked the bug: say so in the log.
+            // Passing, but without having checked the clamp: say so in the log.
             // Written to stderr directly, since the harness captures what
             // `eprintln!` prints from a test that passes.
             use std::io::Write as _;
             let _ = writeln!(
                 std::io::stderr(),
-                "the_budget_fits_under_what_the_kernel_gives_one_process:\n{out}"
+                "budget_fits_under_what_the_kernel_gives_one_process:\n{out}"
             );
         } else {
             assert!(
