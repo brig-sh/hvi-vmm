@@ -328,25 +328,29 @@ booting Image with 1024 MiB ...
 [hvi] virtio-blk[0]: /path/to/disk.img (rw, serial disk0)
 [hvi] virtio-net: built-in stub stack (guest 10.0.2.15, gw 10.0.2.2, DHCP; no egress, no inbound)
 [hvi] open-file limit: 92160
+[hvi] virtio-fs: the exports may hold 91957 open files together; hvi reserves 203 for itself
 [hvi] virtio-fs[0]: /path/to/share as "code" (read-only)
 [hvi] event ledger: /path/to/ledger.ndjson
 [hvi] seatbelt: on (deny default)
 ```
 
-`[hvi] open-file limit:` appears only on macOS, and only when at least one
-share is configured, because the limit is raised while the first share is set
-up. The number is what the process can really hold: the soft `RLIMIT_NOFILE` or
-the kernel's `kern.maxfilesperproc`, whichever is lower. The VM's shares draw on
-one handle budget, that number less a reserve for the rest of the VMM: 128, plus
-68 for each share and 3069 when `--agent-sock` is set. When the limit is too
-small to leave the guest 64 after the reserve, a second line says so, and the
-guest gets 64 anyway.
+`[hvi] open-file limit:` appears only on macOS, and only when at least one share
+is configured, because the limit is raised while the first share is set up. The
+number is what the process can really hold: the soft `RLIMIT_NOFILE` or the
+kernel's `kern.maxfilesperproc`, whichever is lower.
 
-On a clean stop, macOS reports each share's peak handle count, against the
-budget the VM's shares draw on together:
+The line after it gives the budget of open files that the VM's shares draw on
+together: that limit, less what hvi reserves for itself. The reserve covers
+hvi's own descriptors, those of each disk and each share, and those of the
+connections the agent socket may relay. When the limit is smaller than the
+reserve and 64 for the shares, another line says so, and the shares get 64
+anyway.
+
+On a clean stop, macOS reports each share's peak handle count, and repeats the
+budget:
 
 ```text
-[hvi] virtio-fs[0]: peak 1 of the VM's 91964 guest handles
+[hvi] virtio-fs[0]: peak 1 guest handles; the VM's exports may hold 91957 open files together
 guest stopped: SystemOff
 ```
 
