@@ -287,10 +287,10 @@ components itself. Treat containment as strong and tested, not as proven.
   resets. A guest that never sends one grows the table until it resets the
   device.
 - **One budget of open files for the whole VM.** A VM's exports share one
-  process, so they share one budget: the open-file limit hvi logs at startup,
-  less what hvi reserves for itself. [Startup output](cli.md#startup-output)
-  describes both. Open handles, created files, parked descriptors and cached
-  directories all count against the budget.
+  process, so they share one budget: the VM's open-file limit,
+  `--max-open-files`, less what hvi reserves for itself. [Startup
+  output](cli.md#startup-output) describes both. Open handles, created files,
+  parked descriptors and cached directories all count against the budget.
 - **Past the budget, an open closes what is kept for speed.** An `OPEN`,
   `OPENDIR`, `CREATE` or `TMPFILE` past the budget first closes the export's own
   parked descriptors, then the other exports' parked descriptors, then its own
@@ -307,8 +307,8 @@ components itself. Treat containment as strong and tested, not as proven.
   export takes `num_queues=`. No DAX window. The
   device reports no shared memory region, and a guest built with `FUSE_DAX`
   binds the device without DAX.
-- The open file limit is raised when the **first share** is set up, not at
-  startup, and only on macOS. A boot with no share never raises it and never
+- `hvi boot` sets its open-file limit to `--max-open-files`, on macOS only. The
+  limit is logged when the first share is set up, so a boot with no share never
   logs the line.
 - The node table, the descriptor budget and the lock behaviour above are the
   macOS device's. On Linux those belong to the daemon, and its own
@@ -318,7 +318,7 @@ Each export reports its peak handle count on a clean stop, and repeats the
 budget:
 
 ```text
-[hvi] virtio-fs[0]: peak 1 guest handles; the VM's exports may hold 91957 open files together
+[hvi] virtio-fs[0]: peak 1 guest handles; the VM's exports may hold 16181 open files together
 ```
 
 ### What to share

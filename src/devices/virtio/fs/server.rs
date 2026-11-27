@@ -1464,15 +1464,36 @@ pub(crate) struct DescriptorBudget {
     exports: Mutex<Vec<Arc<ExportDescriptors>>>,
     /// Whether the budget has refused a request, so that is logged once.
     refused: AtomicBool,
+    /// What the log of that refusal says raises the budget.
+    remedy: &'static str,
 }
 
+/// What the log of a refusal says raises a budget that the process's open-file
+/// limit bounds.
+pub(crate) const RAISE_PROCESS_LIMIT: &str =
+    "a higher open-file limit or kern.maxfilesperproc raises the budget";
+
+/// What the log of a refusal says raises a budget that the VM's open-file limit
+/// bounds. It names the limit in words that fit a program that embeds hvi as
+/// well as the flag.
+pub(crate) const RAISE_VM_LIMIT: &str =
+    "a higher open-file limit for the VM (--max-open-files) raises the budget";
+
 impl DescriptorBudget {
-    /// Returns a budget of `limit` descriptors that no export draws on yet.
+    /// Returns a budget of `limit` descriptors that no export draws on yet, and
+    /// that the process's open-file limit bounds.
     pub(crate) fn new(limit: usize) -> Self {
+        Self::with_remedy(limit, RAISE_PROCESS_LIMIT)
+    }
+
+    /// Returns a budget of `limit` descriptors that no export draws on yet, and
+    /// whose refusal says that `remedy` raises it.
+    pub(crate) fn with_remedy(limit: usize, remedy: &'static str) -> Self {
         Self {
             limit,
             exports: Mutex::new(Vec::new()),
             refused: AtomicBool::new(false),
+            remedy,
         }
     }
 
@@ -1484,9 +1505,9 @@ impl DescriptorBudget {
             // the VM.
             stderrln!(
                 "{LOG_PREFIX} virtio-fs: the VM's exports reached their budget of {} open \
-                 files, and an open got ENFILE; a higher open-file limit or \
-                 kern.maxfilesperproc raises the budget",
-                self.limit
+                 files, and an open got ENFILE; {}",
+                self.limit,
+                self.remedy
             );
         }
     }

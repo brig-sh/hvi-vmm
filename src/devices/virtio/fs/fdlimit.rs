@@ -82,9 +82,8 @@ pub(crate) fn vmm_reserve(disks: usize, exports: usize, agent: bool) -> u64 {
     BASE_RESERVE.saturating_add(u64::try_from(devices).unwrap_or(u64::MAX))
 }
 
-/// The fewest descriptors a VM's exports are given, whatever the reserve: a
-/// guest cannot run a shell on fewer.
-pub(crate) const MIN_BUDGET: usize = 64;
+/// The fewest descriptors a VM's exports are given, whatever the reserve.
+pub(crate) const MIN_BUDGET: usize = crate::config::MIN_EXPORT_OPEN_FILES;
 
 /// The most this module asks the kernel for.
 const CEILING: u64 = 65_536;
@@ -117,6 +116,76 @@ pub(crate) fn is_floored(usable: u64, reserve: u64) -> bool {
 pub(crate) fn usable_limit() -> u64 {
     let soft = current_open_file_limit().unwrap_or(256);
     clamp_soft_limit(soft, per_process_cap())
+}
+
+/// The open-file limit of a VM whose caller sets none.
+///
+/// A host runs several VMs, and the descriptor table that matters to it is the
+/// system-wide one, `kern.maxfiles`. A VM that may take everything its process
+/// can hold takes a large part of that table, and a few such VMs can exhaust
+/// it. Only the host can keep the sum of its VMs' limits under the table,
+/// because one hvi process does not know how many others run. So the limit is
+/// the caller's to set. The default is modest: several times the working set of
+/// a compiler build.
+pub const DEFAULT_MAX_OPEN_FILES: usize = 16_384;
+
+/// Returns the open-file limit of a VM whose caller asked for `max_open_files`,
+/// or for [`DEFAULT_MAX_OPEN_FILES`] when it is `None`, in a process that can
+/// hold `usable`: the lower of the two.
+///
+/// The limit is the most descriptors hvi holds for the VM, which is
+/// `vmm_reserve` and the exports' budget together. The limits of the VMs on a
+/// host therefore add up to what the VMs can take of the system-wide table.
+#[must_use]
+pub(crate) fn vm_limit(max_open_files: Option<usize>, usable: u64) -> u64 {
+    let wanted = max_open_files.unwrap_or(DEFAULT_MAX_OPEN_FILES);
+    u64::try_from(wanted).unwrap_or(u64::MAX).min(usable)
+}
+
+/// Sets the soft and the hard open-file limit of the process to `limit`, or to
+/// the hard limit in force when that is lower.
+///
+/// `hvi boot` calls it with the VM's open-file limit before it boots. The
+/// process is the VM's alone there, so the kernel then refuses it a descriptor
+/// past the limit. A program that embeds hvi does not call it: the limit is its
+/// process's, and the program holds descriptors of its own.
+///
+/// The hard limit comes down with the soft one, because setting up the exports
+/// and the agent bridge raises the soft limit toward the hard one.
+///
+/// A limit below `MIN_BUDGET` is left alone, for `boot` to refuse.
+///
+/// # Errors
+///
+/// Errors if the limit cannot be read or set.
+pub fn limit_open_files(limit: usize) -> Result<(), String> {
+    if limit < MIN_BUDGET {
+        return Ok(());
+    }
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes into a struct we own and fully initialized.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return Err(format!(
+            "could not read the open-file limit: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let limit = libc::rlim_t::try_from(limit)
+        .unwrap_or(libc::rlim_t::MAX)
+        .min(lim.rlim_max);
+    lim.rlim_cur = limit;
+    lim.rlim_max = limit;
+    // SAFETY: setrlimit reads a struct we own and fully initialized.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) } != 0 {
+        return Err(format!(
+            "could not set the open-file limit to {limit}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 /// Returns how many descriptors a process with the soft limit `soft` can hold
@@ -400,6 +469,74 @@ mod tests {
             Ok(now) => assert!(now >= before, "the limit went down: {before} -> {now}"),
             Err(e) => panic!("could not raise the open-file limit: {e}"),
         }
+    }
+
+    // The VM's limit is what its caller asked for, the default when it asked
+    // for nothing, and never more than the process can hold.
+    #[test]
+    fn vm_limit_is_what_the_caller_set_up_to_what_the_process_can_hold() {
+        assert_eq!(vm_limit(Some(512), 92_160), 512);
+        assert_eq!(
+            vm_limit(None, 92_160),
+            u64::try_from(DEFAULT_MAX_OPEN_FILES).unwrap()
+        );
+        assert_eq!(vm_limit(Some(usize::MAX), 92_160), 92_160);
+        assert_eq!(vm_limit(None, 256), 256);
+    }
+
+    /// The environment variable that marks the child process
+    /// [`limit_open_files_child`] runs in.
+    const LIMIT_CHILD: &str = "HVI_FDLIMIT_LIMIT_CHILD";
+
+    // `hvi boot` holds its process to the VM's open-file limit, and setting up
+    // the exports afterwards must not raise the limit again.
+    //
+    // Run in a process of its own, because the hard limit cannot go back up.
+    #[test]
+    fn limit_open_files_holds_the_process_to_the_limit() {
+        let (status, out, err) = crate::testing::run_child_test(
+            "devices::virtio::fs::fdlimit::tests::limit_open_files_child",
+            LIMIT_CHILD,
+            "1",
+            Duration::from_secs(20),
+        );
+        assert!(status.success(), "the child failed:\n{out}\n{err}");
+        assert!(
+            out.contains("limit-child: checked"),
+            "the child did not run its checks:\n{out}\n{err}"
+        );
+    }
+
+    #[test]
+    fn limit_open_files_child() {
+        if std::env::var_os(LIMIT_CHILD).is_none() {
+            return;
+        }
+        let limits = || {
+            let mut lim = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: getrlimit writes into a struct we own and fully
+            // initialized.
+            assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
+            (lim.rlim_cur, lim.rlim_max)
+        };
+        // Below what a test process starts with on any host, so both limits
+        // come down.
+        let limit = 200;
+        let (_, hard) = limits();
+        assert!(hard >= limit, "the hard limit is already {hard}");
+
+        // A limit too small for any guest is left for `boot` to refuse.
+        limit_open_files(MIN_BUDGET - 1).unwrap();
+        assert_eq!(limits().1, hard);
+
+        limit_open_files(usize::try_from(limit).unwrap()).unwrap();
+        assert_eq!(limits(), (limit, limit));
+        assert_eq!(raise_open_file_limit(), Ok(limit));
+        assert_eq!(limits(), (limit, limit), "the raise moved the limit");
+        println!("limit-child: checked");
     }
 
     // The reserve grows with what the VM holds beside its exports' budget, so

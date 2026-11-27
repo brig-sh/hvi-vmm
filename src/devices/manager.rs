@@ -265,7 +265,12 @@ impl<C: irq::Chip> DeviceManager<C> {
         #[cfg(target_os = "linux")]
         self.attach_exports(&cfg.fs, ram_fd)?;
         #[cfg(target_os = "macos")]
-        self.attach_exports(&cfg.fs_shares, cfg.disks.len(), cfg.agent_sock.is_some())?;
+        self.attach_exports(
+            &cfg.fs_shares,
+            cfg.disks.len(),
+            cfg.agent_sock.is_some(),
+            cfg.max_open_files,
+        )?;
         Ok(())
     }
 
@@ -369,7 +374,8 @@ impl<C: irq::Chip> DeviceManager<C> {
     }
 
     /// Attaches an export for each of `shares`, served in this process, for a
-    /// VM that has `disks` disks, and an agent bridge if `agent`.
+    /// VM that has `disks` disks, an agent bridge if `agent`, and the open-file
+    /// limit `max_open_files`.
     ///
     /// # Errors
     ///
@@ -381,9 +387,13 @@ impl<C: irq::Chip> DeviceManager<C> {
         shares: &[FsShare],
         disks: usize,
         agent: bool,
+        max_open_files: Option<usize>,
     ) -> Result<(), Error> {
         let slots = self.export_slots(shares.len())?;
-        for (export, slot) in worker::attach(shares, disks, agent)?.into_iter().zip(slots) {
+        for (export, slot) in worker::attach(shares, disks, agent, max_open_files)?
+            .into_iter()
+            .zip(slots)
+        {
             self.attach_virtio(DeviceKind::Fs, slot, &export.dev)?;
             export.queue_threads(&self.ram, &mut self.devices.host);
             self.devices.exports.push(export);
