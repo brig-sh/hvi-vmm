@@ -286,15 +286,23 @@ components itself. Treat containment as strong and tested, not as proven.
 - **The node table has no cap.** `FORGET` is what shrinks it between device
   resets. A guest that never sends one grows the table until it resets the
   device.
-- **The descriptor budget is per export, the descriptor table is per process.**
-  Each export refuses an `OPEN` or `OPENDIR` past its budget with `ENFILE`.
-  The budget is the open-file limit hvi logs at startup, less a reserve of 128;
-  see [Startup output](cli.md#startup-output). If the host refuses a descriptor
-  first, the guest gets the refusal, and the export closes half its parked and
-  cached directory descriptors so the requests after it find room. It closes
-  only its own, so it cannot make room that another export holds. `CREATE` and
-  `TMPFILE` are not counted against it, and directory descriptors cached for
-  readdir are not either, so several busy exports can still exhaust the table.
+- **One budget of open files for the whole VM.** A VM's exports share one
+  process, so they share one budget: the open-file limit hvi logs at startup,
+  less what hvi reserves for itself. [Startup output](cli.md#startup-output)
+  describes both. Open handles, created files, parked descriptors and cached
+  directories all count against the budget.
+- **Past the budget, an open closes what is kept for speed.** An `OPEN`,
+  `OPENDIR`, `CREATE` or `TMPFILE` past the budget first closes the export's own
+  parked descriptors, then the other exports' parked descriptors, then its own
+  cached directories. If none are left it is refused with `ENFILE`, and hvi logs
+  the first such refusal. A request that resolves a path caches the directory
+  only while the budget has room. An export's cached directories are closed only
+  by that export, so one export can be refused while another keeps directories
+  cached.
+- **A host refusal closes half of each cache.** If the host refuses a descriptor
+  below the budget, the guest gets that refusal. The export then closes half of
+  its own parked descriptors and cached directories, and half of the other
+  exports' parked descriptors, so the requests after it find room.
 - **One request queue per share on macOS**, plus a hiprio queue. A Linux
   export takes `num_queues=`. No DAX window. The
   device reports no shared memory region, and a guest built with `FUSE_DAX`
@@ -306,10 +314,11 @@ components itself. Treat containment as strong and tested, not as proven.
   macOS device's. On Linux those belong to the daemon, and its own
   documentation covers them.
 
-Each export reports its peak handle count on a clean stop:
+Each export reports its peak handle count on a clean stop, and repeats the
+budget:
 
 ```text
-[hvi] virtio-fs[0]: peak 1 of 92032 guest handles
+[hvi] virtio-fs[0]: peak 1 guest handles; the VM's exports may hold 91957 open files together
 ```
 
 ### What to share
