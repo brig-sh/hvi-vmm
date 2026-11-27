@@ -291,6 +291,10 @@ components itself. Treat containment as strong and tested, not as proven.
   `--max-open-files`, less what hvi reserves for itself. [Startup
   output](cli.md#startup-output) describes both. Open handles, created files,
   parked descriptors and cached directories all count against the budget.
+- **Each export's caches are a part of the budget.** An export parks at most a
+  quarter of the budget. It caches directories up to a sixteenth of its share of
+  the budget among the VM's exports, at least 128 and at most 4,096, and never
+  more than a quarter of that share.
 - **Past the budget, an open closes what is kept for speed.** An `OPEN`,
   `OPENDIR`, `CREATE` or `TMPFILE` past the budget first closes the export's own
   parked descriptors, then the other exports' parked descriptors, then its own
