@@ -167,33 +167,34 @@ impl Export {
         host.on_io_stop(move || stop.stop());
     }
 
-    /// Prints the peak handle count, the operation counts and times, and the
-    /// readahead counts of the device, as export `index`.
+    /// Prints the device's peak handle count, operation counts and times, and
+    /// parked-descriptor and readahead counts, as export `index`.
     ///
     /// A worker left running at the stop deadline can still hold the device,
     /// stuck in a host call, so the lock is only tried. When the device is
     /// held, or a panic poisoned its lock, one line says so and the statistics
     /// are skipped.
     pub(crate) fn report_usage(&self, index: usize) {
+        for line in self.usage_lines(index) {
+            stderrln!("{line}");
+        }
+    }
+
+    /// Returns the lines that [`report_usage`](Self::report_usage) prints.
+    fn usage_lines(&self, index: usize) -> Vec<String> {
         let dev = match self.dev.try_lock() {
             Ok(dev) => dev,
             Err(TryLockError::Poisoned(_)) => {
-                stderrln!("{LOG_PREFIX} virtio-fs[{index}]: statistics skipped after a panic");
-                return;
+                return vec![format!(
+                    "{LOG_PREFIX} virtio-fs[{index}]: statistics skipped after a panic"
+                )];
             }
             Err(TryLockError::WouldBlock) => {
-                stderrln!(
+                return vec![format!(
                     "{LOG_PREFIX} virtio-fs[{index}]: statistics skipped, the device is still in use"
-                );
-                return;
+                )];
             }
         };
-        stderrln!(
-            "{LOG_PREFIX} virtio-fs[{index}]: peak {} guest handles; the VM's exports may hold \
-             {} open files together",
-            dev.peak_handles(),
-            dev.descriptor_budget()
-        );
         let hist: Vec<String> = dev
             .op_stats()
             .into_iter()
@@ -207,11 +208,36 @@ impl Export {
                 )
             })
             .collect();
-        stderrln!("{LOG_PREFIX} virtio-fs[{index}] ops: {}", hist.join(" "));
+        // The parked cache is sized as a part of the descriptor budget, not
+        // from what a workload reopens. `evicted` is how a workload shows what
+        // that costs it: each one is a descriptor closed to make room, and none
+        // means that no hit was lost to a bound. The counts are from boot and
+        // `held` is the moment of the stop, so a guest that reset the device
+        // shows few held beside large counts.
+        let parked = match dev.parked_stats() {
+            Some(server::ParkedStats {
+                hits,
+                misses,
+                evicted,
+                held,
+            }) => format!("hits={hits} misses={misses} evicted={evicted} held={held}"),
+            // Nothing is parked, and every open would read as a miss.
+            None => "off (cache=none)".to_owned(),
+        };
         let (hits, waits, misses) = dev.readahead_stats();
-        stderrln!(
-            "{LOG_PREFIX} virtio-fs[{index}] readahead: hits={hits} waits={waits} misses={misses}"
-        );
+        vec![
+            format!(
+                "{LOG_PREFIX} virtio-fs[{index}]: peak {} guest handles; the VM's exports may \
+                 hold {} open files together",
+                dev.peak_handles(),
+                dev.descriptor_budget()
+            ),
+            format!("{LOG_PREFIX} virtio-fs[{index}] ops: {}", hist.join(" ")),
+            format!("{LOG_PREFIX} virtio-fs[{index}] parked: {parked}"),
+            format!(
+                "{LOG_PREFIX} virtio-fs[{index}] readahead: hits={hits} waits={waits} misses={misses}"
+            ),
+        ]
     }
 }
 
@@ -291,6 +317,52 @@ mod tests {
 
     use super::*;
     use crate::config::CachePolicy;
+
+    /// Returns an export of a new directory that holds the file `f`, with the
+    /// directory.
+    #[allow(clippy::disallowed_methods)]
+    fn export_of_one_file(name: &str, cache: CachePolicy) -> (std::path::PathBuf, Export) {
+        let dir = std::env::temp_dir().join(format!("hvi-fs-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f"), b"x").unwrap();
+        let root = std::fs::canonicalize(&dir).unwrap();
+        let export = Export {
+            dev: Arc::new(Mutex::new(
+                VirtioFs::new(root.clone(), "share", false, cache).unwrap(),
+            )),
+            wake: Arc::new(WorkerWake::new().unwrap()),
+            root,
+            writable: false,
+        };
+        (dir, export)
+    }
+
+    // Three opens of one file are a miss and two hits, so a report that swapped
+    // the two counts would not print this line.
+    #[allow(clippy::disallowed_methods)]
+    #[test]
+    fn stop_report_names_parked_hits_and_misses() {
+        let (dir, export) = export_of_one_file("parked-line", CachePolicy::Auto);
+        export.dev.lock().unwrap().open_and_release("f", 3);
+        let lines = export.usage_lines(1);
+        let parked = format!("{LOG_PREFIX} virtio-fs[1] parked: hits=2 misses=1 evicted=0 held=1");
+        assert!(lines.contains(&parked), "{lines:#?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Under cache=none nothing is parked, and counts that read as all misses
+    // would say the cache had failed.
+    #[allow(clippy::disallowed_methods)]
+    #[test]
+    fn stop_report_marks_an_export_that_parks_nothing() {
+        let (dir, export) = export_of_one_file("parked-off", CachePolicy::None);
+        export.dev.lock().unwrap().open_and_release("f", 3);
+        let lines = export.usage_lines(0);
+        let parked = format!("{LOG_PREFIX} virtio-fs[0] parked: off (cache=none)");
+        assert!(lines.contains(&parked), "{lines:#?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     // A worker stuck in a host call holds the device past the stop deadline.
     // The report must not wait for it, or `boot` never returns the error that
