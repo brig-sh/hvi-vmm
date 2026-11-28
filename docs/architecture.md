@@ -109,8 +109,10 @@ reads builds a `GuestRamView` of its own over the RAM descriptor, with
 Every accessor that takes a guest address resolves it through the view's table
 of the collection's regions and fails with an `io::Error` on a range the guest
 does not own. A range that would cross from one region into the next is refused.
-`scan()` takes no guest address: it walks each region's host mapping and maps
-its hits back to guest addresses.
+`scan()` takes no guest address: it copies each region out of its host mapping
+a window at a time, matches in the copy, and maps its hits back to guest
+addresses. It never borrows the mapping as a byte slice, since the guest can
+write it during the scan.
 
 `slice` returns a bounds-checked `VolatileSlice` of one region, and
 `memory/io.rs` reads and writes a host file straight into and out of such slices
